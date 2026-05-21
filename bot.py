@@ -1,9 +1,10 @@
 import asyncio
 import logging
-from typing import Optional
+from typing import Optional, Union
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -32,8 +33,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ai = GroqAssistant()
-
-# ─── Global cache ─────────────────────────────────────────────────────────────
 _categories_cache: list[dict] = []
 
 
@@ -44,14 +43,33 @@ async def _load_categories() -> list[dict]:
     return _categories_cache
 
 
-# ─── Session helpers ──────────────────────────────────────────────────────────
-
 def _save(ud: dict, **kw) -> None:
     ud.update(kw)
 
 
 def _state(ud: dict) -> Optional[str]:
     return ud.get("state")
+
+
+# ─── Ключевой хелпер: редактировать или отправить новое ───────────────────────
+
+async def _edit(q_msg, text: str, kb=None) -> None:
+    """Редактирует существующее сообщение. Если не получается — отправляет новое."""
+    try:
+        await q_msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    except BadRequest as e:
+        if "Message is not modified" not in str(e):
+            await q_msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    except Exception:
+        await q_msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def _remove_buttons(q_msg) -> None:
+    """Убирает кнопки с сообщения (не удаляя его)."""
+    try:
+        await q_msg.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
 
 # ─── /start ───────────────────────────────────────────────────────────────────
@@ -92,29 +110,41 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ─── Каталог ──────────────────────────────────────────────────────────────────
 
-async def show_catalog(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    ctx.user_data.pop("state", None)
-    msg = update.message or update.callback_query.message
-    if update.callback_query:
-        await update.callback_query.answer()
-
-    loading = await msg.reply_text("⏳ Загружаю категории…")
+async def _show_catalog_in(msg, ctx: ContextTypes.DEFAULT_TYPE, edit: bool) -> None:
+    """Общая логика показа каталога — edit=True редактирует, False отправляет новое."""
     categories = await _load_categories()
-    await loading.delete()
 
     if not categories:
-        await msg.reply_text(
-            f"😔 Не удалось загрузить каталог.\n🌐 {SITE_URL}",
-            reply_markup=back_menu_kb(),
-        )
+        text = f"😔 Не удалось загрузить каталог.\n🌐 {SITE_URL}"
+        if edit:
+            await _edit(msg, text, back_menu_kb())
+        else:
+            await msg.reply_text(text, reply_markup=back_menu_kb())
         return
 
     _save(ctx.user_data, categories=categories)
-    await msg.reply_text(
-        f"📦 <b>Каталог {SITE_NAME}</b>\n\nВыберите категорию:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=categories_kb(categories),
-    )
+    text = f"📦 <b>Каталог {SITE_NAME}</b>\n\nВыберите категорию:"
+    kb = categories_kb(categories)
+
+    if edit:
+        await _edit(msg, text, kb)
+    else:
+        await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def show_catalog_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data.pop("state", None)
+    loading = await update.message.reply_text("⏳ Загружаю категории…")
+    await _show_catalog_in(update.message, ctx, edit=False)
+    await loading.delete()
+
+
+async def show_catalog_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data.pop("state", None)
+    await _edit(q.message, "⏳ Загружаю категории…")
+    await _show_catalog_in(q.message, ctx, edit=True)
 
 
 async def cb_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -124,29 +154,30 @@ async def cb_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     categories = ctx.user_data.get("categories") or await _load_categories()
     if cat_idx >= len(categories):
-        await q.message.reply_text("❌ Категория не найдена.", reply_markup=back_menu_kb())
+        await _edit(q.message, "❌ Категория не найдена.", back_menu_kb())
         return
 
     category = categories[cat_idx]
-    loading = await q.message.reply_text(f"⏳ Загружаю «{category['name']}»…")
-    result = await get_products(category["url"], page=1)
-    await loading.delete()
+    await _edit(q.message, f"⏳ Загружаю «{category['name']}»…")
 
+    result = await get_products(category["url"], page=1)
     products = result["products"]
+
     if not products:
-        await q.message.reply_text(
+        await _edit(
+            q.message,
             f"😔 В «{category['name']}» товары не найдены.\n{category['url']}",
-            reply_markup=back_menu_kb(),
+            back_menu_kb(),
         )
         return
 
     _save(ctx.user_data, products=products, page=1,
           has_next=result["has_next"], cat_idx=cat_idx, categories=categories)
 
-    await q.message.reply_text(
-        f"🎨 <b>{category['name']}</b> — {len(products)} товаров\nВыберите:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=products_kb(products, 1, result["has_next"], cat_idx),
+    await _edit(
+        q.message,
+        f"🎨 <b>{category['name']}</b> — {len(products)} товаров\n\nВыберите:",
+        products_kb(products, 1, result["has_next"], cat_idx),
     )
 
 
@@ -161,38 +192,42 @@ async def cb_page(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     category = categories[cat_idx]
 
-    loading = await q.message.reply_text(f"⏳ Страница {page}…")
+    await _edit(q.message, f"⏳ Загружаю страницу {page}…")
     result = await get_products(category["url"], page=page)
-    await loading.delete()
-
     products = result["products"]
+
     if not products:
-        await q.message.reply_text("😔 Товары не найдены.", reply_markup=back_menu_kb())
+        await _edit(q.message, "😔 Товары не найдены.", back_menu_kb())
         return
 
     _save(ctx.user_data, products=products, page=page,
           has_next=result["has_next"], cat_idx=cat_idx)
 
-    await q.message.reply_text(
-        f"🎨 <b>{category['name']}</b> — стр. {page}",
-        parse_mode=ParseMode.HTML,
-        reply_markup=products_kb(products, page, result["has_next"], cat_idx),
+    await _edit(
+        q.message,
+        f"🎨 <b>{category['name']}</b> — стр. {page}\n\nВыберите:",
+        products_kb(products, page, result["has_next"], cat_idx),
     )
 
 
 async def cb_product(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer("⏳ Загружаю…")
+
     prod_idx = int(q.data.split("_", 1)[1])
     products = ctx.user_data.get("products", [])
 
     if prod_idx >= len(products):
-        await q.message.reply_text("❌ Товар не найден.", reply_markup=back_menu_kb())
+        await _edit(q.message, "❌ Товар не найден.", back_menu_kb())
         return
 
     fallback = products[prod_idx]
+
+    # Убираем кнопки у списка товаров — сигнал что что-то происходит
+    await _remove_buttons(q.message)
+
     detail = await get_product_detail(fallback["url"]) or {
-        **fallback, "properties": {}, "description": "", "brand": ""
+        **fallback, "properties": {}, "description": "", "brand": "",
     }
 
     lines = [f"🎨 <b>{detail['name']}</b>"]
@@ -208,6 +243,7 @@ async def cb_product(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = "\n".join(lines)
     kb = product_detail_kb(detail["url"])
 
+    # Если есть изображение — отправляем новое сообщение с фото
     if detail.get("image"):
         try:
             await q.message.reply_photo(
@@ -217,10 +253,11 @@ async def cb_product(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 reply_markup=kb,
             )
             return
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Не удалось отправить фото: {e}")
 
-    await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    # Без фото — редактируем текущее сообщение
+    await _edit(q.message, text, kb)
 
 
 async def cb_go_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -228,6 +265,7 @@ async def cb_go_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await q.answer()
     ud = ctx.user_data
     products = ud.get("products", [])
+
     if not products:
         await q.message.reply_text("🏠 Главное меню:", reply_markup=main_menu_kb())
         return
@@ -236,8 +274,9 @@ async def cb_go_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cat_idx = ud.get("cat_idx", 0)
     cat_name = categories[cat_idx]["name"] if cat_idx < len(categories) else "Товары"
 
+    # reply_text — потому что предыдущее сообщение может быть фото
     await q.message.reply_text(
-        f"🎨 <b>{cat_name}</b>\nВыберите товар:",
+        f"🎨 <b>{cat_name}</b>\n\nВыберите товар:",
         parse_mode=ParseMode.HTML,
         reply_markup=products_kb(products, ud.get("page", 1), ud.get("has_next", False), cat_idx),
     )
@@ -245,17 +284,25 @@ async def cb_go_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ─── Поиск ────────────────────────────────────────────────────────────────────
 
-async def start_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.message or update.callback_query.message
-    if update.callback_query:
-        await update.callback_query.answer()
+async def start_search_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     _save(ctx.user_data, state="searching")
-    await msg.reply_text(
-        "🔍 <b>Поиск товаров</b>\n\n"
-        "Введите название товара или бренда:\n"
+    await update.message.reply_text(
+        "🔍 <b>Поиск товаров</b>\n\nВведите название товара или бренда:\n"
         "<i>Например: «Dulux», «краска для дерева», «молотковая»</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=back_menu_kb(),
+    )
+
+
+async def start_search_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    _save(ctx.user_data, state="searching")
+    await _edit(
+        q.message,
+        "🔍 <b>Поиск товаров</b>\n\nВведите название товара или бренда:\n"
+        "<i>Например: «Dulux», «краска для дерева», «молотковая»</i>",
+        back_menu_kb(),
     )
 
 
@@ -280,8 +327,10 @@ async def process_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     for i, p in enumerate(products):
         label = p["name"][:48] + "…" if len(p["name"]) > 48 else p["name"]
         rows.append([InlineKeyboardButton(f"🎨 {label}", callback_data=f"prod_{i}")])
-    rows.append([InlineKeyboardButton("🔍 Новый поиск", callback_data="search"),
-                 InlineKeyboardButton("🏠 Меню", callback_data="main_menu")])
+    rows.append([
+        InlineKeyboardButton("🔍 Новый поиск", callback_data="search"),
+        InlineKeyboardButton("🏠 Меню", callback_data="main_menu"),
+    ])
 
     await update.message.reply_text(
         f"✅ Найдено {len(products)} товаров по запросу «{query}»:",
@@ -291,12 +340,9 @@ async def process_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
 # ─── ИИ-чат ───────────────────────────────────────────────────────────────────
 
-async def start_ai_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.message or update.callback_query.message
-    if update.callback_query:
-        await update.callback_query.answer()
+async def start_ai_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     _save(ctx.user_data, state="ai_chat")
-    await msg.reply_text(
+    await update.message.reply_text(
         "🤖 <b>ИИ-консультант по краскам</b>\n\n"
         "Задайте вопрос о красках, лаках, грунтовках или малярных работах.\n\n"
         "<b>Примеры:</b>\n"
@@ -304,9 +350,27 @@ async def start_ai_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "• Чем покрасить деревянный забор?\n"
         "• Сколько краски на 20 м²?\n"
         "• Разница между акриловой и алкидной?\n\n"
-        "<i>Бот работает только по теме красок и стройматериалов.</i>",
+        "<i>Консультирую только по теме красок и стройматериалов.</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=ai_chat_kb(),
+    )
+
+
+async def start_ai_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    _save(ctx.user_data, state="ai_chat")
+    await _edit(
+        q.message,
+        "🤖 <b>ИИ-консультант по краскам</b>\n\n"
+        "Задайте вопрос о красках, лаках, грунтовках или малярных работах.\n\n"
+        "<b>Примеры:</b>\n"
+        "• Какую краску выбрать для детской комнаты?\n"
+        "• Чем покрасить деревянный забор?\n"
+        "• Сколько краски на 20 м²?\n"
+        "• Разница между акриловой и алкидной?\n\n"
+        "<i>Консультирую только по теме красок и стройматериалов.</i>",
+        ai_chat_kb(),
     )
 
 
@@ -320,9 +384,10 @@ async def process_ai_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 async def cb_clear_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.callback_query.answer("История очищена!")
     ai.clear_history(update.effective_user.id)
-    await update.callback_query.message.reply_text(
+    await _edit(
+        update.callback_query.message,
         "🗑 История диалога очищена. Начните новый разговор!",
-        reply_markup=ai_chat_kb(),
+        ai_chat_kb(),
     )
 
 
@@ -330,25 +395,27 @@ async def cb_clear_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
 async def cb_contacts(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.callback_query.answer()
-    await update.callback_query.message.reply_text(
+    await _edit(
+        update.callback_query.message,
         f"📞 <b>Контакты {SITE_NAME}</b>\n\n"
         f"🌐 Сайт: {SITE_URL}\n\n"
         "Специализируемся на красках, лаках, штукатурках\n"
         "и малярных инструментах в Казахстане.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=back_menu_kb(),
+        back_menu_kb(),
     )
 
 
-# ─── Главное меню ─────────────────────────────────────────────────────────────
+# ─── Главное меню (кнопка) ────────────────────────────────────────────────────
 
 async def cb_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.callback_query.answer()
+    q = update.callback_query
+    await q.answer()
     ctx.user_data.pop("state", None)
-    await update.callback_query.message.reply_text("🏠 Главное меню:", reply_markup=main_menu_kb())
+    # reply_text — потому что предыдущее сообщение может быть фото
+    await q.message.reply_text("🏠 Главное меню:", reply_markup=main_menu_kb())
 
 
-# ─── Входящие сообщения ───────────────────────────────────────────────────────
+# ─── Входящие текстовые сообщения ─────────────────────────────────────────────
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     state = _state(ctx.user_data)
@@ -371,19 +438,19 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Commands
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("menu", cmd_menu))
-    app.add_handler(CommandHandler("catalog", show_catalog))
-    app.add_handler(CommandHandler("search", start_search))
-    app.add_handler(CommandHandler("ai", start_ai_chat))
+    # Команды
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("help",    cmd_help))
+    app.add_handler(CommandHandler("menu",    cmd_menu))
+    app.add_handler(CommandHandler("catalog", show_catalog_cmd))
+    app.add_handler(CommandHandler("search",  start_search_cmd))
+    app.add_handler(CommandHandler("ai",      start_ai_cmd))
 
-    # Callbacks
-    app.add_handler(CallbackQueryHandler(show_catalog,      pattern="^catalog$"))
+    # Коллбэки — каждая кнопка редактирует сообщение на месте
+    app.add_handler(CallbackQueryHandler(show_catalog_cb,   pattern="^catalog$"))
     app.add_handler(CallbackQueryHandler(cb_main_menu,      pattern="^main_menu$"))
-    app.add_handler(CallbackQueryHandler(start_search,      pattern="^search$"))
-    app.add_handler(CallbackQueryHandler(start_ai_chat,     pattern="^ai_chat$"))
+    app.add_handler(CallbackQueryHandler(start_search_cb,   pattern="^search$"))
+    app.add_handler(CallbackQueryHandler(start_ai_cb,       pattern="^ai_chat$"))
     app.add_handler(CallbackQueryHandler(cb_contacts,       pattern="^contacts$"))
     app.add_handler(CallbackQueryHandler(cb_go_back,        pattern="^go_back$"))
     app.add_handler(CallbackQueryHandler(cb_clear_history,  pattern="^clear_history$"))
@@ -391,7 +458,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_page,           pattern=r"^page_\d+_\d+$"))
     app.add_handler(CallbackQueryHandler(cb_product,        pattern=r"^prod_\d+$"))
 
-    # Text messages
+    # Текстовые сообщения
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Бот запущен. Ожидание сообщений…")
@@ -399,7 +466,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    import asyncio
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     main()
