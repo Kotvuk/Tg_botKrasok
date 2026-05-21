@@ -11,8 +11,6 @@ HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
 }
 
 TIMEOUT = aiohttp.ClientTimeout(total=20)
@@ -28,6 +26,33 @@ def _abs(url: str) -> str:
     return SITE_URL + (url if url.startswith("/") else "/" + url)
 
 
+def _site_img(soup_el) -> str:
+    """Ищем изображения по реальному пути сайта /upload/iblock/"""
+    # Приоритет — картинки из /upload/ (реальные фото товаров)
+    for img in soup_el.find_all("img"):
+        for attr in ("src", "data-src", "data-lazy-src", "data-original"):
+            src = img.get(attr, "")
+            if src and "/upload/" in src and not src.endswith(".gif"):
+                return _abs(src)
+    return ""
+
+
+def _find_price(soup_el) -> str:
+    for sel in [".catalog-element-offer-price", ".price", "[class*='price']", ".cost", "strong"]:
+        for el in soup_el.select(sel):
+            text = el.get_text(" ", strip=True)
+            if any(c.isdigit() for c in text) and ("KZT" in text or "₸" in text or "тг" in text.lower() or any(c.isdigit() for c in text)):
+                # Проверяем что это цена (есть цифры и похоже на деньги)
+                if len(text) < 30:
+                    return text
+    # Fallback — ищем просто числа с "тенге"-контекстом
+    for el in soup_el.find_all(string=lambda t: t and "KZT" in t):
+        text = el.strip()
+        if len(text) < 40:
+            return text
+    return "По запросу"
+
+
 async def _fetch(url: str, session: aiohttp.ClientSession) -> Optional[str]:
     try:
         async with session.get(url, headers=HEADERS, timeout=TIMEOUT, ssl=False) as resp:
@@ -36,33 +61,6 @@ async def _fetch(url: str, session: aiohttp.ClientSession) -> Optional[str]:
     except Exception:
         pass
     return None
-
-
-def _find_price(soup_el) -> str:
-    for sel in [
-        ".catalog-element-offer-price",
-        ".price",
-        "[class*='price']",
-        ".cost",
-    ]:
-        el = soup_el.select_one(sel)
-        if el:
-            text = el.get_text(" ", strip=True)
-            if any(c.isdigit() for c in text):
-                return text
-    return "По запросу"
-
-
-def _find_img(soup_el, *, attribute: bool = False) -> str:
-    img = soup_el.find("img")
-    if not img:
-        return ""
-    # Prefer high-res variants
-    for attr in ("data-src", "data-lazy-src", "data-original", "src"):
-        src = img.get(attr, "")
-        if src and not src.endswith(".gif") and "placeholder" not in src:
-            return _abs(src)
-    return ""
 
 
 async def get_categories() -> list[dict]:
@@ -74,12 +72,10 @@ async def get_categories() -> list[dict]:
         soup = BeautifulSoup(html, "lxml")
         categories: list[dict] = []
 
-        # Bitrix24 typical selectors for catalog sections
         for selector in [
             ".catalog-section-item",
             ".section-item",
             ".catalog-section",
-            ".catalog-section-list li",
             ".bx-catalog-section",
             "div[class*='section']",
         ]:
@@ -90,11 +86,10 @@ async def get_categories() -> list[dict]:
                     if not link:
                         continue
                     href = link.get("href", "")
-                    if "/catalog/" not in href:
+                    if "/catalog/" not in href or href.count("/") < 2:
                         continue
                     name_el = (
-                        item.find("h2")
-                        or item.find("h3")
+                        item.find("h2") or item.find("h3")
                         or item.find(class_=lambda x: x and "name" in str(x).lower())
                         or link
                     )
@@ -104,12 +99,12 @@ async def get_categories() -> list[dict]:
                     categories.append({
                         "name": name,
                         "url": _abs(href),
-                        "image": _find_img(item),
+                        "image": _site_img(item),
                     })
                 if categories:
                     break
 
-        # Fallback: grab all /catalog/xxx/ nav links
+        # Fallback: все ссылки /catalog/xxx/
         if not categories:
             seen: set[str] = set()
             for a in soup.find_all("a", href=True):
@@ -121,11 +116,10 @@ async def get_categories() -> list[dict]:
                     and href != "/catalog/"
                 ):
                     seen.add(href)
-                    categories.append({
-                        "name": a.get_text(strip=True) or href,
-                        "url": _abs(href),
-                        "image": "",
-                    })
+                    name = a.get_text(strip=True)
+                    if name and len(name) > 2:
+                        categories.append({"name": name, "url": _abs(href), "image": ""})
+
         return categories
 
 
@@ -149,7 +143,6 @@ async def get_products(category_url: str, page: int = 1) -> dict:
             ".catalog-item-block",
             ".product-item",
             "[data-entity='product']",
-            ".bx-catalog-element",
             "div[class*='catalog-element']",
             "div[class*='product']",
         ]:
@@ -157,17 +150,28 @@ async def get_products(category_url: str, page: int = 1) -> dict:
             if len(items) >= 2:
                 break
 
+        # Fallback: ищем блоки с ссылками на товары и ценами
+        if not items:
+            candidates = []
+            for div in soup.find_all("div"):
+                a = div.find("a", href=True)
+                img = div.find("img", src=lambda s: s and "/upload/" in s)
+                if a and img and "/catalog/" in a.get("href", ""):
+                    candidates.append(div)
+            items = candidates[:8]
+
+        seen_urls: set[str] = set()
         for item in items[:8]:
             link = item.find("a", href=True)
             if not link:
                 continue
             href = link.get("href", "")
-            if "/catalog/" not in href:
+            if "/catalog/" not in href or href in seen_urls:
                 continue
+            seen_urls.add(href)
 
             name_el = (
-                item.find("h2")
-                or item.find("h3")
+                item.find("h2") or item.find("h3")
                 or item.find(class_=lambda x: x and "name" in str(x).lower())
                 or item.find(class_=lambda x: x and "title" in str(x).lower())
             )
@@ -175,14 +179,15 @@ async def get_products(category_url: str, page: int = 1) -> dict:
             if not name or len(name) < 3:
                 continue
 
+            image = _site_img(item)
+
             products.append({
                 "name": name,
                 "url": _abs(href),
                 "price": _find_price(item),
-                "image": _find_img(item),
+                "image": image,
             })
 
-        # Next page detection
         has_next = bool(
             soup.select_one(".bx-pag-next, .pager-next, a[title*='Следующая'], a[class*='next']")
         ) or len(products) >= 8
@@ -200,9 +205,9 @@ async def get_product_detail(product_url: str) -> Optional[dict]:
 
         soup = BeautifulSoup(html, "lxml")
 
-        # Name
+        # Название
         name = ""
-        for sel in ["h1", ".catalog-element-name h1", ".product-name"]:
+        for sel in ["h1", ".catalog-element-name", ".product-name"]:
             el = soup.select_one(sel)
             if el:
                 name = el.get_text(strip=True)
@@ -210,43 +215,53 @@ async def get_product_detail(product_url: str) -> Optional[dict]:
         if not name:
             name = "Без названия"
 
-        # Price
+        # Цена
         price = _find_price(soup)
 
-        # Image — prefer detail/gallery images
+        # Изображение — ищем самый большой /upload/ img на странице
         image = ""
+        # Сначала ищем в типичных блоках детальной страницы
         for sel in [
             ".catalog-element-big-picture img",
             ".product-image-big img",
-            ".swiper-slide img",
             ".detail-picture img",
-            ".product-detail-gallery img",
-            "img[class*='detail']",
+            ".swiper-slide img",
+            "[class*='gallery'] img",
+            "[class*='detail'] img",
         ]:
             el = soup.select_one(sel)
             if el:
-                for attr in ("data-src", "data-original", "src"):
+                for attr in ("src", "data-src", "data-original"):
                     src = el.get(attr, "")
-                    if src and "placeholder" not in src:
+                    if src and "/upload/" in src:
                         image = _abs(src)
                         break
             if image:
                 break
 
-        # Description
+        # Fallback — любое /upload/ изображение на странице (кроме иконок)
+        if not image:
+            for img in soup.find_all("img"):
+                src = img.get("src", "") or img.get("data-src", "")
+                if src and "/upload/iblock/" in src and not src.endswith(".gif"):
+                    # Берём первое — обычно главное фото товара
+                    image = _abs(src)
+                    break
+
+        # Описание
         description = ""
         for sel in [
             ".catalog-element-description",
-            ".product-detail-tab-description",
             ".detail-text",
             "[class*='description']",
+            ".tabs-content",
         ]:
             el = soup.select_one(sel)
             if el:
                 description = el.get_text(" ", strip=True)[:600]
                 break
 
-        # Brand
+        # Бренд
         brand = ""
         for sel in [".brand-name", "[class*='brand']", "[itemprop='brand']"]:
             el = soup.select_one(sel)
@@ -254,20 +269,20 @@ async def get_product_detail(product_url: str) -> Optional[dict]:
                 brand = el.get_text(strip=True)
                 break
 
-        # Properties table
+        # Характеристики
         properties: dict[str, str] = {}
-        for table in soup.select("table[class*='prop'], table[class*='char'], .props_main table"):
+        for table in soup.select("table"):
             for row in table.find_all("tr"):
                 cols = row.find_all("td")
                 if len(cols) >= 2:
                     k = cols[0].get_text(strip=True)
                     v = cols[1].get_text(strip=True)
-                    if k and v:
+                    if k and v and len(k) < 60:
                         properties[k] = v
             if properties:
                 break
 
-        # Fallback: look for dl/dt/dd pairs
+        # Fallback: dl/dt/dd
         if not properties:
             for dl in soup.find_all("dl"):
                 keys = [dt.get_text(strip=True) for dt in dl.find_all("dt")]
@@ -289,11 +304,9 @@ async def get_product_detail(product_url: str) -> Optional[dict]:
 
 async def search_products(query: str) -> list[dict]:
     encoded = query.replace(" ", "+")
-    # Try common Bitrix24 search URLs
     search_urls = [
         f"{SITE_URL}/search/?q={encoded}",
         f"{SITE_URL}/catalog/?q={encoded}",
-        f"{SITE_URL}/?s={encoded}",
     ]
 
     async with aiohttp.ClientSession() as session:
@@ -318,17 +331,18 @@ async def search_products(query: str) -> list[dict]:
                 if items:
                     break
 
+            seen_urls: set[str] = set()
             for item in items[:10]:
                 link = item.find("a", href=True)
                 if not link:
                     continue
                 href = link.get("href", "")
-                if "/catalog/" not in href:
+                if "/catalog/" not in href or href in seen_urls:
                     continue
+                seen_urls.add(href)
 
                 name_el = (
-                    item.find("h2")
-                    or item.find("h3")
+                    item.find("h2") or item.find("h3")
                     or item.find(class_=lambda x: x and "name" in str(x).lower())
                 )
                 name = name_el.get_text(strip=True) if name_el else link.get_text(strip=True)
@@ -339,7 +353,7 @@ async def search_products(query: str) -> list[dict]:
                     "name": name,
                     "url": _abs(href),
                     "price": _find_price(item),
-                    "image": _find_img(item),
+                    "image": _site_img(item),
                 })
 
             if products:
